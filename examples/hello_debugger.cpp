@@ -20,6 +20,7 @@
 #include "dap/session.h"
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdio>
 #include <mutex>
@@ -45,8 +46,11 @@ namespace {
 // Event provides a basic wait and signal synchronization primitive.
 class Event {
  public:
-  // wait() blocks until the event is fired.
+  // wait() blocks until the event is fired, resetting it if signalled.
   void wait();
+
+  // test() tests the event state, reseting it if signalled.
+  bool test();
 
   // fire() sets signals the event, and unblocks any calls to wait().
   void fire();
@@ -61,6 +65,15 @@ void Event::wait() {
   std::unique_lock<std::mutex> lock(mutex);
   fired = false;
   cv.wait(lock, [&] { return fired; });
+}
+
+bool Event::test() {
+  std::unique_lock<std::mutex> lock(mutex);
+  if (fired) {
+    fired = false;
+    return true;
+  }
+  return false;
 }
 
 void Event::fire() {
@@ -116,77 +129,85 @@ class Debugger {
 
  private:
   EventHandler onEvent;
+
+  struct State {
+    int line = 1;
+    bool running = true;
+    std::unordered_set<int> breakpoints;
+  };
+
   std::mutex mutex;
-  int line = 1;
-  std::unordered_set<int> breakpoints;
-  std::atomic<bool> terminate{false};
-  std::atomic<bool> running{true};
-  ::Event canRun;
+  State state;  // guarded by mutex
+
+  ::Event pause_ev;
+  ::Event resume_ev;
+
+  std::atomic<bool> terminate = {false};
 };
 
 Debugger::Debugger(const EventHandler& onEvent) : onEvent(onEvent) {}
 
 void Debugger::run() {
   while (!terminate) {
-    // If not running, wait
-    if (!running) {
-      canRun.wait();
+    if (pause_ev.test()) {
+      resume_ev.wait();  // Wait for resume signal
     }
 
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    std::unique_lock<std::mutex> lock(mutex);
+
     // Go to next line
-    line = (line % numSourceLines) + 1;
+    state.line = (state.line % numSourceLines) + 1;
 
     // Check for breakpoints
-    std::unique_lock<std::mutex> lock(mutex);
-    if (breakpoints.count(line)) {
-      lock.unlock();
-      running = false;
+    if (state.breakpoints.count(state.line) > 0) {
+      state.running = false;
       onEvent(Event::BreakpointHit);
+      pause_ev.fire();
     }
   }
 }
 
 void Debugger::stop() {
   terminate = true;
-  resume();
+  resume_ev.fire();
 }
 
 void Debugger::resume() {
-  running = true;
-  canRun.fire();
+  resume_ev.fire();
 }
 
 void Debugger::pause() {
-  running = false;
+  pause_ev.fire();
   onEvent(Event::Paused);
 }
 
 int Debugger::currentLine() {
   std::unique_lock<std::mutex> lock(mutex);
-  return line;
+  return state.line;
 }
 
 void Debugger::stepForward() {
   std::unique_lock<std::mutex> lock(mutex);
-  line = (line % numSourceLines) + 1;
-  lock.unlock();
+  state.line = (state.line % numSourceLines) + 1;
   onEvent(Event::Stepped);
 }
 
 void Debugger::clearBreakpoints() {
   std::unique_lock<std::mutex> lock(mutex);
-  this->breakpoints.clear();
+  state.breakpoints.clear();
 }
 
 void Debugger::addBreakpoint(int l) {
   std::unique_lock<std::mutex> lock(mutex);
-  this->breakpoints.emplace(l);
+  state.breakpoints.emplace(l);
 }
 
 }  // anonymous namespace
 
 // main() entry point to the DAP server.
-int main(int, char* []) {
+int main(int, char*[]) {
 #ifdef OS_WINDOWS
   // Change stdin & stdout from text mode to binary mode.
   // This ensures sequences of \r\n are not changed to \n.
